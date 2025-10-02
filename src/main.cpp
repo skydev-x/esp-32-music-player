@@ -1,22 +1,20 @@
+#include "config.h"
 #include <Arduino.h>
 #include <AudioFileSourceSD.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
+#include <BLE2902.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
 
-// SD Card Pin
-#define SD_CS 5
-
-// File cache configuration
-#define CACHE_FILE "/playlist.cache"
-#define MAX_FILES 300
-
 // Audio file storage with metadata
 struct AudioFile {
-  char path[128]; // Increased for long filenames
+  char path[128];
   bool isMP3;
   uint32_t size;
 };
@@ -41,6 +39,13 @@ const uint32_t SWITCH_TIMEOUT_MS = 3000;
 // Track current volume
 float currentGain = 0.9;
 
+// BLE objects
+BLEServer *pServer = nullptr;
+BLECharacteristic *pTxCharacteristic = nullptr;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+String bleInputBuffer = "";
+
 // ===== Buttons =====
 #define BTN_UP 32
 #define BTN_DOWN 33
@@ -54,23 +59,106 @@ struct ButtonState {
 };
 ButtonState buttons[4];
 
+// Forward declarations
+void handleCommand(char cmd, const String &arg, bool fromBLE);
+void sendBLE(const String &message);
+void sendOutput(const String &message);
+void sendOutputln(const String &message);
+
+// ===== BLE OUTPUT FUNCTIONS =====
+
+void sendBLE(const String &message) {
+  if (deviceConnected && pTxCharacteristic) {
+    int len = message.length();
+    int offset = 0;
+
+    while (offset < len) {
+      int chunkSize = min(20, len - offset);
+      String chunk = message.substring(offset, offset + chunkSize);
+      pTxCharacteristic->setValue(chunk.c_str());
+      pTxCharacteristic->notify();
+      offset += chunkSize;
+      delay(10);
+    }
+  }
+}
+
+void sendOutput(const String &message) {
+  Serial.print(message);
+  if (deviceConnected) {
+    sendBLE(message);
+  }
+}
+
+void sendOutputln(const String &message) {
+  Serial.println(message);
+  if (deviceConnected) {
+    sendBLE(message + "\n");
+  }
+}
+
+void processBLECommand(const String &input) {
+  String trimmed = input;
+  trimmed.trim();
+
+  if (trimmed.length() > 0) {
+    char cmd = trimmed[0];
+    String arg = trimmed.substring(1);
+    arg.trim();
+    handleCommand(cmd, arg, true);
+  }
+}
+
+// ===== BLE CALLBACKS (MUST BE BEFORE initBLE) =====
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) {
+    deviceConnected = true;
+    Serial.println("BLE Client Connected");
+
+    BLEDevice::stopAdvertising();
+    delay(100);
+
+    sendBLE("Connected to ESP32 Audio Player\n");
+    sendBLE("Type 'h' for help\n");
+  }
+
+  void onDisconnect(BLEServer *pServer) {
+    deviceConnected = false;
+    Serial.println("BLE Client Disconnected");
+    delay(500);
+    BLEDevice::startAdvertising();
+    Serial.println("Restarting BLE advertising");
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string rxValue = pCharacteristic->getValue();
+    if (rxValue.length() > 0) {
+      String input = String(rxValue.c_str());
+      input.trim();
+      if (input.length() > 0) {
+        processBLECommand(input);
+      }
+    }
+  }
+};
+
 // ===== FILE CACHE MANAGEMENT =====
 
-// Save playlist to cache file
 bool savePlaylistCache() {
-  Serial.println("Saving playlist cache...");
+  sendOutputln("Saving playlist cache...");
 
   File cacheFile = SD.open(CACHE_FILE, FILE_WRITE);
   if (!cacheFile) {
-    Serial.println("Failed to create cache file");
+    sendOutputln("Failed to create cache file");
     return false;
   }
 
-  // Write header: version and file count
   cacheFile.println("V1");
   cacheFile.println(fileCount);
 
-  // Write each file entry: path|isMP3|size
   for (int i = 0; i < fileCount; i++) {
     cacheFile.print(audioFiles[i].path);
     cacheFile.print("|");
@@ -80,45 +168,41 @@ bool savePlaylistCache() {
   }
 
   cacheFile.close();
-  Serial.println("Cache saved successfully");
+  sendOutputln("Cache saved successfully");
   return true;
 }
 
-// Load playlist from cache file
 bool loadPlaylistCache() {
   if (!SD.exists(CACHE_FILE)) {
-    Serial.println("No cache file found");
+    sendOutputln("No cache file found");
     return false;
   }
 
-  Serial.println("Loading playlist cache...");
+  sendOutputln("Loading playlist cache...");
   File cacheFile = SD.open(CACHE_FILE, FILE_READ);
   if (!cacheFile) {
-    Serial.println("Failed to open cache file");
+    sendOutputln("Failed to open cache file");
     return false;
   }
 
-  // Read and verify version
   String version = cacheFile.readStringUntil('\n');
   version.trim();
   if (version != "V1") {
-    Serial.println("Invalid cache version");
+    sendOutputln("Invalid cache version");
     cacheFile.close();
     return false;
   }
 
-  // Read file count
   String countStr = cacheFile.readStringUntil('\n');
   countStr.trim();
   int cachedCount = countStr.toInt();
 
   if (cachedCount <= 0 || cachedCount > MAX_FILES) {
-    Serial.println("Invalid file count in cache");
+    sendOutputln("Invalid file count in cache");
     cacheFile.close();
     return false;
   }
 
-  // Read each file entry
   fileCount = 0;
   while (cacheFile.available() && fileCount < cachedCount) {
     String line = cacheFile.readStringUntil('\n');
@@ -127,13 +211,12 @@ bool loadPlaylistCache() {
     if (line.length() == 0)
       continue;
 
-    // Parse: path|isMP3|size
     int firstPipe = line.indexOf('|');
     int secondPipe = line.lastIndexOf('|');
 
     if (firstPipe == -1 || secondPipe == -1 || firstPipe == secondPipe) {
-      Serial.print("Malformed cache line: ");
-      Serial.println(line);
+      sendOutput("Malformed cache line: ");
+      sendOutputln(line);
       continue;
     }
 
@@ -141,14 +224,12 @@ bool loadPlaylistCache() {
     String isMP3Str = line.substring(firstPipe + 1, secondPipe);
     String sizeStr = line.substring(secondPipe + 1);
 
-    // Verify file still exists
     if (!SD.exists(path)) {
-      Serial.print("Cached file missing: ");
-      Serial.println(path);
+      sendOutput("Cached file missing: ");
+      sendOutputln(path);
       continue;
     }
 
-    // Store in array
     strncpy(audioFiles[fileCount].path, path.c_str(), 127);
     audioFiles[fileCount].path[127] = '\0';
     audioFiles[fileCount].isMP3 = (isMP3Str == "1");
@@ -158,28 +239,24 @@ bool loadPlaylistCache() {
 
   cacheFile.close();
 
-  Serial.print("Loaded ");
-  Serial.print(fileCount);
-  Serial.println(" files from cache");
+  sendOutput("Loaded ");
+  sendOutput(String(fileCount));
+  sendOutputln(" files from cache");
 
   return fileCount > 0;
 }
 
-// ===== OPTIMIZED UTILITY FUNCTIONS =====
+// ===== UTILITY FUNCTIONS =====
 
-// Fast file type detection - no String conversion
 bool isAudioFile(const char *filename) {
   int len = strlen(filename);
   if (len < 4)
     return false;
 
-  // Check last 4 characters for .mp3 or .wav (case insensitive)
   const char *ext = filename + len - 4;
-
   return (strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".wav") == 0);
 }
 
-// Check if filename is MP3
 bool isMP3File(const char *filename) {
   int len = strlen(filename);
   if (len < 4)
@@ -189,14 +266,13 @@ bool isMP3File(const char *filename) {
   return (strcasecmp(ext, ".mp3") == 0);
 }
 
-// Scan SD card and build file list
 bool scanSDCard() {
-  Serial.println("Scanning SD card...");
+  sendOutputln("Scanning SD card...");
   fileCount = 0;
 
   File root = SD.open("/");
   if (!root) {
-    Serial.println("Failed to open root directory");
+    sendOutputln("Failed to open root directory");
     return false;
   }
 
@@ -206,7 +282,6 @@ bool scanSDCard() {
       const char *fileName = file.name();
 
       if (isAudioFile(fileName)) {
-        // Build path
         if (fileName[0] == '/') {
           strncpy(audioFiles[fileCount].path, fileName, 127);
         } else {
@@ -224,16 +299,15 @@ bool scanSDCard() {
   }
   root.close();
 
-  Serial.print("Found ");
-  Serial.print(fileCount);
-  Serial.println(" audio files");
+  sendOutput("Found ");
+  sendOutput(String(fileCount));
+  sendOutputln(" audio files");
 
   return fileCount > 0;
 }
 
 // ===== AUDIO SYSTEM MANAGEMENT =====
 
-// Initialize audio system once
 bool initializeAudioSystem() {
   if (!output) {
     output = new AudioOutputI2S();
@@ -257,10 +331,9 @@ bool initializeAudioSystem() {
   return (output && source && mp3 && wav);
 }
 
-// Safe cleanup without deletion
 void safeStopPlayback() {
   if (playerState == SWITCHING)
-    return; // Already switching
+    return;
 
   playerState = SWITCHING;
 
@@ -278,42 +351,37 @@ void safeStopPlayback() {
   playerState = STOPPED;
 }
 
-// Robust file playing with error recovery
 bool playFileRobust(int index, int maxRetries = 3) {
   if (index < 0 || index >= fileCount) {
-    Serial.println("Invalid file index");
+    sendOutputln("Invalid file index");
     return false;
   }
 
-  // Timeout protection
   uint32_t startTime = millis();
   if (startTime - lastSwitchTime < 100) {
-    Serial.println("Switch too fast, skipping");
+    sendOutputln("Switch too fast, skipping");
     return false;
   }
   lastSwitchTime = startTime;
 
-  // Safe cleanup
   safeStopPlayback();
 
   AudioFile &audioFile = audioFiles[index];
-  Serial.print("Loading [");
-  Serial.print(index + 1);
-  Serial.print("]: ");
-  Serial.println(audioFile.path);
+  sendOutput("Loading [");
+  sendOutput(String(index + 1));
+  sendOutput("]: ");
+  sendOutputln(audioFile.path);
 
   int retryCount = 0;
   while (retryCount < maxRetries) {
-    // Open file
     if (!source->open(audioFile.path)) {
-      Serial.print("File open failed, retry ");
-      Serial.println(retryCount + 1);
+      sendOutput("File open failed, retry ");
+      sendOutputln(String(retryCount + 1));
       retryCount++;
       delay(100);
       continue;
     }
 
-    // Initialize appropriate generator
     bool success = false;
     if (audioFile.isMP3) {
       success = mp3->begin(source, output);
@@ -324,24 +392,22 @@ bool playFileRobust(int index, int maxRetries = 3) {
     if (success) {
       currentFileIndex = index;
       playerState = PLAYING;
-      Serial.println("Playback started");
+      sendOutputln("Playback started");
       return true;
     }
 
-    Serial.print("Generator failed, retry ");
-    Serial.println(retryCount + 1);
+    sendOutput("Generator failed, retry ");
+    sendOutputln(String(retryCount + 1));
     source->close();
     retryCount++;
     delay(100);
   }
 
-  // All retries failed
   playerState = ERROR_STATE;
-  Serial.println("File load failed completely");
+  sendOutputln("File load failed completely");
   return false;
 }
 
-// Smart next song with fallback
 void playNext() {
   if (fileCount == 0)
     return;
@@ -349,31 +415,69 @@ void playNext() {
   int nextIndex = (currentFileIndex + 1) % fileCount;
 
   if (!playFileRobust(nextIndex)) {
-    Serial.println("Next song failed, stopping playback");
+    sendOutputln("Next song failed, stopping playback");
     playerState = STOPPED;
   }
 }
 
-// Sequential previous with error handling (FIXED modulo bug)
 void playPrevious() {
   if (fileCount == 0)
     return;
 
-  // Fixed: Proper handling of negative modulo
   int prevIndex = (currentFileIndex - 1 + fileCount) % fileCount;
 
   if (!playFileRobust(prevIndex)) {
-    Serial.println("Previous song failed, staying on current");
+    sendOutputln("Previous song failed, staying on current");
   }
+}
+
+// ===== BLE INITIALIZATION =====
+
+void initBLE() {
+  Serial.println("Initializing BLE...");
+
+  BLEDevice::init(BLE_DEVICE_NAME);
+  BLEDevice::setMTU(BLE_MTU_SIZE);
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pTxCharacteristic = pService->createCharacteristic(
+      CHAR_UUID_TX,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+      CHAR_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMaxPreferred(0x12);
+
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE Ready - Waiting for connection...");
+  Serial.print("Device name: ");
+  Serial.println(BLE_DEVICE_NAME);
 }
 
 // ===== SYSTEM INITIALIZATION =====
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Give serial time to initialize
+  delay(1000);
 
-  Serial.println("\n\n=== ESP32 Audio Player ===");
+  Serial.println("\n\n=== ESP32 Audio Player with BLE ===");
+
+  // Initialize BLE FIRST
+  initBLE();
 
   randomSeed(analogRead(0) + millis());
   SPI.begin();
@@ -396,10 +500,8 @@ void setup() {
     }
   }
 
-  // Try to load from cache first
   bool cacheLoaded = loadPlaylistCache();
 
-  // If cache failed or user wants rescan, do full scan
   if (!cacheLoaded) {
     Serial.println("Performing full SD scan...");
     if (!scanSDCard() || fileCount == 0) {
@@ -407,18 +509,14 @@ void setup() {
       while (1)
         delay(1000);
     }
-
-    // Save the new playlist cache
     savePlaylistCache();
   }
 
-  // Initialize buttons
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_PLAY, INPUT_PULLUP);
   pinMode(BTN_PAUSE, INPUT_PULLUP);
 
-  // Initialize audio system
   if (!initializeAudioSystem()) {
     Serial.println("Audio system initialization failed");
     while (1)
@@ -428,9 +526,10 @@ void setup() {
   Serial.println("System ready!");
   Serial.println("Type 'h' for help");
 
-  // Start with first song (or configured index)
   delay(500);
-  playFileRobust(3);
+  if (fileCount > 0) {
+    playFileRobust(4);
+  }
 }
 
 // ===== INPUT HANDLING =====
@@ -440,24 +539,24 @@ void handleButtons() {
   uint32_t now = millis();
 
   for (int i = 0; i < 4; i++) {
-    bool currentPressed = !digitalRead(btnPins[i]); // Active LOW
+    bool currentPressed = !digitalRead(btnPins[i]);
 
     if (currentPressed && !buttons[i].wasPressed &&
-        (now - buttons[i].lastPress > 200)) { // 200ms debounce
+        (now - buttons[i].lastPress > 200)) {
 
       buttons[i].lastPress = now;
 
       switch (i) {
-      case 0: // UP - Previous
+      case 0:
         playPrevious();
         break;
-      case 1: // DOWN - Next
+      case 1:
         playNext();
         break;
-      case 2: // PLAY - Restart current
+      case 2:
         playFileRobust(currentFileIndex);
         break;
-      case 3: // PAUSE - Stop
+      case 3:
         safeStopPlayback();
         break;
       }
@@ -467,7 +566,68 @@ void handleButtons() {
   }
 }
 
-void handleSerialCommand(char cmd, const String &arg) {
+// ===== MAIN LOOP =====
+
+void loop() {
+  static uint32_t lastHealthCheck = 0;
+  uint32_t now = millis();
+
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500);
+    pServer->startAdvertising();
+    Serial.println("Restarting BLE advertising");
+    oldDeviceConnected = deviceConnected;
+  }
+
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+
+  handleButtons();
+
+  if (playerState == PLAYING) {
+    bool isPlaying = false;
+
+    if (audioFiles[currentFileIndex].isMP3 && mp3) {
+      isPlaying = mp3->isRunning() && mp3->loop();
+    } else if (!audioFiles[currentFileIndex].isMP3 && wav) {
+      isPlaying = wav->isRunning() && wav->loop();
+    }
+
+    if (!isPlaying) {
+      sendOutputln("Song ended, playing next");
+      playNext();
+    }
+  }
+
+  if (now - lastHealthCheck > 10000) {
+    if (playerState == ERROR_STATE) {
+      sendOutputln("Recovering from error state");
+      playerState = STOPPED;
+      delay(500);
+    }
+    lastHealthCheck = now;
+  }
+
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input.length() > 0) {
+      char cmd = input[0];
+      String arg = input.substring(1);
+      arg.trim();
+      handleCommand(cmd, arg, false);
+    }
+
+    while (Serial.available())
+      Serial.read();
+  }
+
+  yield();
+}
+
+void handleCommand(char cmd, const String &arg, bool fromBLE) {
   switch (cmd) {
   case 'n':
   case 'N':
@@ -482,7 +642,7 @@ void handleSerialCommand(char cmd, const String &arg) {
   case 's':
   case 'S':
     safeStopPlayback();
-    Serial.println("Stopped");
+    sendOutputln("Stopped");
     break;
 
   case 'r':
@@ -491,165 +651,107 @@ void handleSerialCommand(char cmd, const String &arg) {
     break;
 
   case 'c':
-  case 'C': {
-    // Rescan SD card and update cache
-    Serial.println("Rescanning SD card...");
+  case 'C':
+    sendOutputln("Rescanning SD card...");
     if (scanSDCard()) {
       savePlaylistCache();
-      Serial.println("Cache updated");
+      sendOutputln("Cache updated");
     }
     break;
-  }
 
   case 'l':
   case 'L': {
-    Serial.println("\n=== Playlist ===");
+    sendOutputln("\n=== Playlist ===");
     int displayCount = min(fileCount, 30);
     for (int i = 0; i < displayCount; i++) {
-      Serial.print(i == currentFileIndex ? "> " : "  ");
-      Serial.print(i + 1);
-      Serial.print(". ");
-      Serial.println(audioFiles[i].path);
+      String line = "";
+      line += (i == currentFileIndex ? "> " : "  ");
+      line += String(i + 1);
+      line += ". ";
+      line += audioFiles[i].path;
+      sendOutputln(line);
     }
     if (fileCount > 30) {
-      Serial.print("... and ");
-      Serial.print(fileCount - 30);
-      Serial.println(" more");
+      String more = "... and ";
+      more += String(fileCount - 30);
+      more += " more";
+      sendOutputln(more);
     }
-    Serial.println();
+    sendOutputln("");
     break;
   }
 
-  case '+': {
+  case '+':
     currentGain = min(1.0f, currentGain + 0.1f);
     if (output)
       output->SetGain(currentGain);
-    Serial.print("Volume: ");
-    Serial.println((int)(currentGain * 100));
+    sendOutput("Volume: ");
+    sendOutputln(String((int)(currentGain * 100)));
     break;
-  }
 
-  case '-': {
+  case '-':
     currentGain = max(0.0f, currentGain - 0.1f);
     if (output)
       output->SetGain(currentGain);
-    Serial.print("Volume: ");
-    Serial.println((int)(currentGain * 100));
+    sendOutput("Volume: ");
+    sendOutputln(String((int)(currentGain * 100)));
     break;
-  }
 
-  case 'g': {
+  case 'g':
     if (arg.length() > 0) {
-      int targetIndex = arg.toInt() - 1; // Convert to 0-based
+      int targetIndex = arg.toInt() - 1;
       if (targetIndex >= 0 && targetIndex < fileCount) {
         playFileRobust(targetIndex);
       } else {
-        Serial.println("Invalid track number");
+        sendOutputln("Invalid track number");
       }
     }
     break;
-  }
 
   case 'i': {
-    Serial.println("\n=== Status ===");
-    Serial.print("State: ");
-    Serial.println(playerState == PLAYING     ? "PLAYING"
-                   : playerState == STOPPED   ? "STOPPED"
-                   : playerState == SWITCHING ? "SWITCHING"
-                                              : "ERROR");
-    Serial.print("Track: ");
-    Serial.print(currentFileIndex + 1);
-    Serial.print("/");
-    Serial.println(fileCount);
-    Serial.print("File: ");
-    Serial.println(audioFiles[currentFileIndex].path);
-    Serial.print("Volume: ");
-    Serial.print((int)(currentGain * 100));
-    Serial.println("%");
-    Serial.println();
+    sendOutputln("\n=== Status ===");
+    sendOutput("State: ");
+    sendOutputln(playerState == PLAYING     ? "PLAYING"
+                 : playerState == STOPPED   ? "STOPPED"
+                 : playerState == SWITCHING ? "SWITCHING"
+                                            : "ERROR");
+    sendOutput("Track: ");
+    sendOutput(String(currentFileIndex + 1));
+    sendOutput("/");
+    sendOutputln(String(fileCount));
+    sendOutput("File: ");
+    sendOutputln(audioFiles[currentFileIndex].path);
+    sendOutput("Volume: ");
+    sendOutput(String((int)(currentGain * 100)));
+    sendOutputln("%");
+    sendOutput("BLE: ");
+    sendOutputln(deviceConnected ? "Connected" : "Disconnected");
+    sendOutputln("");
     break;
   }
 
   case 'h':
   case 'H':
-  case '?': {
-    Serial.println("\n=== Commands ===");
-    Serial.println("n - Next track");
-    Serial.println("p - Previous track");
-    Serial.println("s - Stop playback");
-    Serial.println("r - Restart current track");
-    Serial.println("l - List tracks");
-    Serial.println("c - Rescan SD & update cache");
-    Serial.println("+ - Volume up");
-    Serial.println("- - Volume down");
-    Serial.println("g<num> - Go to track (e.g., g5)");
-    Serial.println("i - Show info");
-    Serial.println("h - Show this help");
-    Serial.println();
+  case '?':
+    sendOutputln("\n=== Commands ===");
+    sendOutputln("n - Next track");
+    sendOutputln("p - Previous track");
+    sendOutputln("s - Stop playback");
+    sendOutputln("r - Restart current track");
+    sendOutputln("l - List tracks");
+    sendOutputln("c - Rescan SD & update cache");
+    sendOutputln("+ - Volume up");
+    sendOutputln("- - Volume down");
+    sendOutputln("g<num> - Go to track (e.g., g5)");
+    sendOutputln("i - Show info");
+    sendOutputln("h - Show this help");
+    sendOutputln("");
     break;
-  }
 
   default:
-    Serial.print("Unknown command: ");
-    Serial.println(cmd);
-    Serial.println("Type 'h' for help");
+    sendOutput("Unknown command: ");
+    sendOutputln(String(cmd));
+    sendOutputln("Type 'h' for help");
     break;
   }
-}
-
-// ===== MAIN LOOP =====
-
-void loop() {
-  static uint32_t lastHealthCheck = 0;
-  uint32_t now = millis();
-
-  // Handle buttons
-  handleButtons();
-
-  // Audio playback management
-  if (playerState == PLAYING) {
-    bool isPlaying = false;
-
-    if (audioFiles[currentFileIndex].isMP3 && mp3) {
-      isPlaying = mp3->isRunning() && mp3->loop();
-    } else if (!audioFiles[currentFileIndex].isMP3 && wav) {
-      isPlaying = wav->isRunning() && wav->loop();
-    }
-
-    if (!isPlaying) {
-      Serial.println("Song ended, playing next");
-      playNext();
-    }
-  }
-  // REMOVED: Auto-restart logic (was causing unwanted behavior)
-
-  // Health check and recovery
-  if (now - lastHealthCheck > 10000) { // Every 10 seconds
-    if (playerState == ERROR_STATE) {
-      Serial.println("Recovering from error state");
-      playerState = STOPPED;
-      delay(500);
-      // Don't auto-play, wait for user input
-    }
-    lastHealthCheck = now;
-  }
-
-  // Handle serial commands
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-
-    if (input.length() > 0) {
-      char cmd = input[0];
-      String arg = input.substring(1);
-      arg.trim();
-      handleSerialCommand(cmd, arg);
-    }
-
-    // Clear any remaining buffer
-    while (Serial.available())
-      Serial.read();
-  }
-
-  yield(); // Allow background tasks
 }
