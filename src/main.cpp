@@ -1,4 +1,5 @@
 #include "config.h"
+#include "type.h"
 #include <Arduino.h>
 #include <AudioFileSourceSD.h>
 #include <AudioGeneratorMP3.h>
@@ -10,14 +11,11 @@
 #include <BLEUtils.h>
 #include <SD.h>
 #include <SPI.h>
+#include <SerialController.h>
 #include <Wire.h>
 
-// Audio file storage with metadata
-struct AudioFile {
-  char path[128];
-  bool isMP3;
-  uint32_t size;
-};
+SerialController serial;
+
 AudioFile audioFiles[MAX_FILES];
 int fileCount = 0;
 int currentFileIndex = 0;
@@ -28,8 +26,6 @@ AudioGeneratorMP3 *mp3 = nullptr;
 AudioGeneratorWAV *wav = nullptr;
 AudioOutputI2S *output = nullptr;
 
-// System state management
-enum PlayerState { STOPPED, PLAYING, SWITCHING, ERROR_STATE };
 PlayerState playerState = STOPPED;
 
 // Performance tracking
@@ -46,17 +42,6 @@ bool deviceConnected = false;
 bool oldDeviceConnected = false;
 String bleInputBuffer = "";
 
-// ===== Buttons =====
-#define BTN_UP 32
-#define BTN_DOWN 33
-#define BTN_PLAY 25
-#define BTN_PAUSE 26
-
-// Button state management
-struct ButtonState {
-  uint32_t lastPress;
-  bool wasPressed;
-};
 ButtonState buttons[4];
 
 // Forward declarations
@@ -84,14 +69,14 @@ void sendBLE(const String &message) {
 }
 
 void sendOutput(const String &message) {
-  Serial.print(message);
+  serial.print(message);
   if (deviceConnected) {
     sendBLE(message);
   }
 }
 
 void sendOutputln(const String &message) {
-  Serial.println(message);
+  serial.println(message);
   if (deviceConnected) {
     sendBLE(message + "\n");
   }
@@ -114,7 +99,7 @@ void processBLECommand(const String &input) {
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     deviceConnected = true;
-    Serial.println("BLE Client Connected");
+    serial.println("BLE Client Connected");
 
     BLEDevice::stopAdvertising();
     delay(100);
@@ -125,10 +110,10 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
   void onDisconnect(BLEServer *pServer) {
     deviceConnected = false;
-    Serial.println("BLE Client Disconnected");
+    serial.println("BLE Client Disconnected");
     delay(500);
     BLEDevice::startAdvertising();
-    Serial.println("Restarting BLE advertising");
+    serial.println("Restarting BLE advertising");
   }
 };
 
@@ -434,7 +419,7 @@ void playPrevious() {
 // ===== BLE INITIALIZATION =====
 
 void initBLE() {
-  Serial.println("Initializing BLE...");
+  serial.println("Initializing BLE...");
 
   BLEDevice::init(BLE_DEVICE_NAME);
   BLEDevice::setMTU(BLE_MTU_SIZE);
@@ -463,18 +448,18 @@ void initBLE() {
 
   BLEDevice::startAdvertising();
 
-  Serial.println("BLE Ready - Waiting for connection...");
-  Serial.print("Device name: ");
-  Serial.println(BLE_DEVICE_NAME);
+  serial.println("BLE Ready - Waiting for connection...");
+  serial.print("Device name: ");
+  serial.println(BLE_DEVICE_NAME);
 }
 
 // ===== SYSTEM INITIALIZATION =====
 
 void setup() {
-  Serial.begin(115200);
+  serial.begin(115200);
   delay(1000);
 
-  Serial.println("\n\n=== ESP32 Audio Player with BLE ===");
+  serial.println("\n\n=== ESP32 Audio Player with BLE ===");
 
   // Initialize BLE FIRST
   initBLE();
@@ -483,18 +468,18 @@ void setup() {
   SPI.begin();
 
   // Initialize SD card
-  Serial.println("Initializing SD card...");
+  serial.println("Initializing SD card...");
   for (int retry = 0; retry < 5; retry++) {
     if (SD.begin(SD_CS)) {
-      Serial.println("SD Card ready");
+      serial.println("SD Card ready");
       break;
     }
-    Serial.print("SD retry ");
-    Serial.println(retry + 1);
+    serial.print("SD retry ");
+    serial.println(retry + 1);
     delay(1000);
 
     if (retry == 4) {
-      Serial.println("SD Card failed completely");
+      serial.println("SD Card failed completely");
       while (1)
         delay(1000);
     }
@@ -503,9 +488,9 @@ void setup() {
   bool cacheLoaded = loadPlaylistCache();
 
   if (!cacheLoaded) {
-    Serial.println("Performing full SD scan...");
+    serial.println("Performing full SD scan...");
     if (!scanSDCard() || fileCount == 0) {
-      Serial.println("No audio files found");
+      serial.println("No audio files found");
       while (1)
         delay(1000);
     }
@@ -518,13 +503,13 @@ void setup() {
   pinMode(BTN_PAUSE, INPUT_PULLUP);
 
   if (!initializeAudioSystem()) {
-    Serial.println("Audio system initialization failed");
+    serial.println("Audio system initialization failed");
     while (1)
       delay(1000);
   }
 
-  Serial.println("System ready!");
-  Serial.println("Type 'h' for help");
+  serial.println("System ready!");
+  serial.println("Type 'h' for help");
 
   delay(500);
   if (fileCount > 0) {
@@ -575,7 +560,7 @@ void loop() {
   if (!deviceConnected && oldDeviceConnected) {
     delay(500);
     pServer->startAdvertising();
-    Serial.println("Restarting BLE advertising");
+    serial.println("Restarting BLE advertising");
     oldDeviceConnected = deviceConnected;
   }
 
@@ -609,8 +594,8 @@ void loop() {
     lastHealthCheck = now;
   }
 
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
+  if (serial.available()) {
+    String input = serial.readStringUntil('\n');
     input.trim();
 
     if (input.length() > 0) {
@@ -620,8 +605,8 @@ void loop() {
       handleCommand(cmd, arg, false);
     }
 
-    while (Serial.available())
-      Serial.read();
+    while (serial.available())
+      serial.read();
   }
 
   yield();
